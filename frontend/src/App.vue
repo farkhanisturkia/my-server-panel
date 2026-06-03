@@ -29,7 +29,7 @@ const fetchContainers = async () => {
   try {
     const response = await axios.get<ContainerInfo[]>(`${API_BASE_URL}/docker/containers`)
     containers.value = response.data
-    message.value = ''
+    // message.value = ''
   } catch (error: any) {
     message.value = 'Gagal memuat data dari server backend.'
     console.error(error)
@@ -38,15 +38,29 @@ const fetchContainers = async () => {
   }
 }
 
+let messageTimer: ReturnType<typeof setTimeout> | null = null
+
 const handleAction = async (action: 'start' | 'stop' | 'down', id: string) => {
   loading.value = true
   openDropdownId.value = null 
+
+  if (messageTimer) {
+    clearTimeout(messageTimer)
+  }
+
   try {
+    message.value = `Menjalankan perintah ${action.toUpperCase()} untuk kontainer...`
     const response = await axios.post<{ message: string }>(`${API_BASE_URL}/docker/containers/${id}/${action}`)
-    message.value = response.data.message
     await fetchContainers()
+    message.value = response.data.message
+    messageTimer = setTimeout(() => {
+      message.value = ''
+    }, 3000)
   } catch (error: any) {
     message.value = error.response?.data?.error || `Gagal melakukan aksi ${action}`
+    messageTimer = setTimeout(() => {
+      message.value = ''
+    }, 3000)
   } finally {
     loading.value = false
   }
@@ -147,9 +161,11 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
-      <div v-if="message" class="mb-6 p-3.5 bg-slate-950/80 border border-cyan-500/20 rounded-xl text-xs text-cyan-300 font-mono shadow-[0_0_15px_rgba(6,182,212,0.05)]">
-        SYSTEM LOG: {{ message }}
-      </div>
+      <Transition name="fade">
+        <div v-if="message" class="mb-6 p-3.5 bg-slate-950/80 border border-cyan-500/20 rounded-xl text-xs text-cyan-300 font-mono shadow-[0_0_15px_rgba(6,182,212,0.05)]">
+          SYSTEM LOG: {{ message }}
+        </div>
+      </Transition>
 
       <div class="w-full bg-slate-950/40 backdrop-blur-sm border border-slate-800 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.4)] overflow-visible">
         
@@ -257,5 +273,20 @@ onBeforeUnmount(() => {
 @keyframes slideDown {
   from { opacity: 0; transform: translateY(-10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: all 0.4s ease-in-out;
+}
+
+.fade-enter-from {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
 }
 </style>
