@@ -78,7 +78,7 @@ func main() {
 			}
 
 			cleanContainers = append(cleanContainers, ContainerInfo{
-				ID:         item.ID,
+				ID:         item.ID[:8],
 				Names:      cleanNames,
 				Image:      item.Image,
 				State:      item.State,
