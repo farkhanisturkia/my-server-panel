@@ -8,6 +8,10 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/cloudflare/cloudflare-go/v4"
+	"github.com/cloudflare/cloudflare-go/v4/option"
+	"github.com/cloudflare/cloudflare-go/v4/zero_trust"
+
 	"github.com/creack/pty"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
@@ -25,9 +29,20 @@ type ContainerInfo struct {
 	WorkingDir string   `json:"working_dir"`
 }
 
+type TunnelResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+}
+
+type RouteResponse struct {
+	Hostname string `json:"hostname"`
+	Service  string `json:"service"`
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// Mengizinkan koneksi dari origin mana pun
 		return true
 	},
 }
@@ -53,7 +68,16 @@ func main() {
 		c.Next()
 	})
 
-	// 1. GET: List Container yang sudah diformat ringkas
+	// Inisialisasi Cloudflare Client V4
+	cfToken := os.Getenv("CF_API_TOKEN")
+	cfAccountID := os.Getenv("CF_ACCOUNT_ID")
+	cfClient := cloudflare.NewClient(option.WithAPIToken(cfToken))
+
+	// ==========================================
+	// DOCKER SUBSYSTEM ROUTING
+	// ==========================================
+
+	// 1. GET: List Container
 	r.GET("/api/docker/containers", func(c *gin.Context) {
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
@@ -178,7 +202,6 @@ func main() {
 	r.GET("/api/docker/containers/:id/terminal", func(c *gin.Context) {
 		containerID := c.Param("id")
 
-		// Upgrade koneksi HTTP biasa menjadi protokol WebSocket
 		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			log.Println("Gagal melakukan upgrade koneksi WebSocket:", err)
@@ -186,13 +209,10 @@ func main() {
 		}
 		defer ws.Close()
 
-		// Inisialisasi shell bash dengan flag login
 		cmd := exec.Command("bash", "--login")
 		cmd.Env = os.Environ()
 
-		// Tentukan direktori kerja berdasarkan parameter ID
 		if containerID == "local-machine" {
-			// Jika local-machine, arahkan ke Home Directory (~)
 			homeDir, err := os.UserHomeDir()
 			if err != nil {
 				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal mendeteksi Home Directory perangkat.\r\n"))
@@ -200,48 +220,42 @@ func main() {
 			}
 			cmd.Dir = homeDir
 		} else {
-			// Jika berupa ID kontainer, hubungi Docker API untuk mencari label working_dir proyeknya
 			cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 			if err != nil {
-				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal menghubungkan ke Docker Engine: "+err.Error()+"\r\n"))
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal menghubungkan ke Docker Engine: " + err.Error() + "\r\n"))
 				return
 			}
 			defer cli.Close()
 
 			inspect, err := cli.ContainerInspect(context.Background(), containerID)
 			if err != nil {
-				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal melakukan inspeksi kontainer: "+err.Error()+"\r\n"))
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal melakukan inspeksi kontainer: " + err.Error() + "\r\n"))
 				return
 			}
 
-			// Ambil lokasi direktori kerja docker-compose dari label
 			workingDir := inspect.Config.Labels["com.docker.compose.project.working_dir"]
 			if workingDir == "" {
 				ws.WriteMessage(websocket.TextMessage, []byte("\r\n[WARN]: Label working_dir proyek tidak ditemukan. Menggunakan fallback root.\r\n"))
 				homeDir, _ := os.UserHomeDir()
 				cmd.Dir = homeDir
 			} else {
-				// Cek apakah direktori tersebut benar-scale ada di file system host
 				if _, err := os.Stat(workingDir); os.IsNotExist(err) {
-					ws.WriteMessage(websocket.TextMessage, []byte("\r\n[ERROR]: Direktori proyek "+workingDir+" tidak ditemukan di host ini.\r\n"))
+					ws.WriteMessage(websocket.TextMessage, []byte("\r\n[ERROR]: Direktori proyek " + workingDir + " tidak ditemukan di host ini.\r\n"))
 					return
 				}
 				cmd.Dir = workingDir
 			}
 		}
 
-		// Alokasikan Pseudo-TTY (PTY) agar shell berjalan interaktif
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
-			ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal memulai sesi PTY: "+err.Error()+"\r\n"))
+			ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal memulai sesi PTY: " + err.Error() + "\r\n"))
 			return
 		}
 		defer ptmx.Close()
 
-		// Channel untuk sinkronisasi penutupan proses terminal
 		done := make(chan struct{})
 
-		// Goroutine 1: Membaca output (stdout/stderr) -> Kirim ke UI Vue Xterm
 		go func() {
 			buf := make([]byte, 1024)
 			for {
@@ -256,7 +270,6 @@ func main() {
 			close(done)
 		}()
 
-		// Goroutine 2: Membaca kiriman input teks ketikan dari UI Vue -> Masukkan ke stdin
 		go func() {
 			for {
 				_, message, err := ws.ReadMessage()
@@ -267,9 +280,76 @@ func main() {
 			}
 		}()
 
-		// Tunggu hingga proses shell selesai atau koneksi terputus
 		<-done
 		_ = cmd.Wait()
+	})
+
+	// ==========================================
+	// CLOUDFLARE TUNNEL SUBSYSTEM ROUTING
+	// ==========================================
+
+	// 1. GET: List Cloudflare Tunnels
+	r.GET("/api/cloudflare/tunnels", func(c *gin.Context) {
+		if cfToken == "" || cfAccountID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "API Token atau Account ID Cloudflare belum di-set di env"})
+			return
+		}
+
+		tunnels, err := cfClient.ZeroTrust.Tunnels.Cloudflared.List(
+			context.Background(),
+			zero_trust.TunnelCloudflaredListParams{
+				AccountID: cloudflare.F(cfAccountID),
+			},
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data Cloudflare: " + err.Error()})
+			return
+		}
+
+		var list []TunnelResponse
+		for _, t := range tunnels.Result {
+			list = append(list, TunnelResponse{
+				ID:        t.ID,
+				Name:      t.Name,
+				Status:    string(t.Status),
+				CreatedAt: t.CreatedAt.String(),
+			})
+		}
+
+		c.JSON(http.StatusOK, list)
+	})
+
+	// 2. GET: List Published Ingress Routes
+	r.GET("/api/cloudflare/tunnels/:id/routes", func(c *gin.Context) {
+		tunnelID := c.Param("id")
+		if cfToken == "" || cfAccountID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "API Token atau Account ID Cloudflare belum di-set di env"})
+			return
+		}
+
+		config, err := cfClient.ZeroTrust.Tunnels.Cloudflared.Configurations.Get(
+			context.Background(),
+			tunnelID,
+			zero_trust.TunnelCloudflaredConfigurationGetParams{
+				AccountID: cloudflare.F(cfAccountID),
+			},
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil konfigurasi rute: " + err.Error()})
+			return
+		}
+
+		var routes []RouteResponse
+		for _, ingress := range config.Config.Ingress {
+			if ingress.Hostname != "" {
+				routes = append(routes, RouteResponse{
+					Hostname: ingress.Hostname,
+					Service:  ingress.Service,
+				})
+			}
+		}
+
+		c.JSON(http.StatusOK, routes)
 	})
 
 	port := os.Getenv("PORT")
