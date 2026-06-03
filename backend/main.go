@@ -5,22 +5,31 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
+	"github.com/creack/pty"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
 
-// Struct ringkas untuk dikirim ke frontend Vue
 type ContainerInfo struct {
 	ID         string   `json:"id"`
 	Names      []string `json:"names"`
 	Image      string   `json:"image"`
-	State      string   `json:"state"` // running, exited, dll
-	Status     string   `json:"status"` // Exited (0) 6 hours ago
-	WorkingDir string   `json:"working_dir"` // Lokasi project docker-compose
+	State      string   `json:"state"`
+	Status     string   `json:"status"`
+	WorkingDir string   `json:"working_dir"`
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		// Mengizinkan koneksi dari origin mana pun
+		return true
+	},
 }
 
 func main() {
@@ -61,17 +70,15 @@ func main() {
 
 		var cleanContainers []ContainerInfo
 		for _, item := range containers {
-			// Ambil info working directory docker-compose dari label jika ada
 			workingDir := item.Labels["com.docker.compose.project.working_dir"]
 
-			// Rapikan nama container (buang garing "/" di depan nama)
 			var cleanNames []string
 			for _, name := range item.Names {
 				cleanNames = append(cleanNames, strings.TrimPrefix(name, "/"))
 			}
 
 			cleanContainers = append(cleanContainers, ContainerInfo{
-				ID:         item.ID[:12], // potong 12 karakter aja biar rapi di UI
+				ID:         item.ID,
 				Names:      cleanNames,
 				Image:      item.Image,
 				State:      item.State,
@@ -114,7 +121,6 @@ func main() {
 		}
 		defer cli.Close()
 
-		// Stop dengan timeout default (nil berarti pakai default bawaan docker)
 		err = cli.ContainerStop(context.Background(), containerID, container.StopOptions{})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mematikan container: " + err.Error()})
@@ -124,7 +130,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"message": "Container " + containerID + " berhasil dimatikan"})
 	})
 
-	// 4. POST: Down Container (Hanya Stop dan Remove Container, Tanpa Hapus Volume)
+	// 4. POST: Down Container
 	r.POST("/api/docker/containers/:id/down", func(c *gin.Context) {
 		containerID := c.Param("id")
 
@@ -137,14 +143,12 @@ func main() {
 
 		ctx := context.Background()
 
-		// 1. Cek status container terlebih dahulu
 		inspect, err := cli.ContainerInspect(ctx, containerID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal inspeksi container: " + err.Error()})
 			return
 		}
 
-		// 2. Jika container masih running, kita STOP dulu
 		if inspect.State.Running {
 			log.Printf("Menghentikan container %s sebelum dihapus...", containerID)
 			err = cli.ContainerStop(ctx, containerID, container.StopOptions{})
@@ -154,11 +158,10 @@ func main() {
 			}
 		}
 
-		// 3. REMOVE Container (Tanpa menghapus volume pendukungnya)
 		log.Printf("Menghapus container %s...", containerID)
 		err = cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
-			RemoveVolumes: false, // <-- Ini dikunci di false agar volume tetap aman
-			Force:         true,  // Paksa hapus jika ada kendala minor
+			RemoveVolumes: false,
+			Force:         true,
 		})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus container: " + err.Error()})
@@ -169,6 +172,104 @@ func main() {
 			"message":      "Container berhasil di-down (dihentikan & dihapus) tanpa menghapus volume data.",
 			"container_id": containerID,
 		})
+	})
+
+	// 5. GET/WS: Real-time Terminal Stream
+	r.GET("/api/docker/containers/:id/terminal", func(c *gin.Context) {
+		containerID := c.Param("id")
+
+		// Upgrade koneksi HTTP biasa menjadi protokol WebSocket
+		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Println("Gagal melakukan upgrade koneksi WebSocket:", err)
+			return
+		}
+		defer ws.Close()
+
+		// Inisialisasi shell bash dengan flag login
+		cmd := exec.Command("bash", "--login")
+		cmd.Env = os.Environ()
+
+		// Tentukan direktori kerja berdasarkan parameter ID
+		if containerID == "local-machine" {
+			// Jika local-machine, arahkan ke Home Directory (~)
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal mendeteksi Home Directory perangkat.\r\n"))
+				return
+			}
+			cmd.Dir = homeDir
+		} else {
+			// Jika berupa ID kontainer, hubungi Docker API untuk mencari label working_dir proyeknya
+			cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+			if err != nil {
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal menghubungkan ke Docker Engine: "+err.Error()+"\r\n"))
+				return
+			}
+			defer cli.Close()
+
+			inspect, err := cli.ContainerInspect(context.Background(), containerID)
+			if err != nil {
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal melakukan inspeksi kontainer: "+err.Error()+"\r\n"))
+				return
+			}
+
+			// Ambil lokasi direktori kerja docker-compose dari label
+			workingDir := inspect.Config.Labels["com.docker.compose.project.working_dir"]
+			if workingDir == "" {
+				ws.WriteMessage(websocket.TextMessage, []byte("\r\n[WARN]: Label working_dir proyek tidak ditemukan. Menggunakan fallback root.\r\n"))
+				homeDir, _ := os.UserHomeDir()
+				cmd.Dir = homeDir
+			} else {
+				// Cek apakah direktori tersebut benar-scale ada di file system host
+				if _, err := os.Stat(workingDir); os.IsNotExist(err) {
+					ws.WriteMessage(websocket.TextMessage, []byte("\r\n[ERROR]: Direktori proyek "+workingDir+" tidak ditemukan di host ini.\r\n"))
+					return
+				}
+				cmd.Dir = workingDir
+			}
+		}
+
+		// Alokasikan Pseudo-TTY (PTY) agar shell berjalan interaktif
+		ptmx, err := pty.Start(cmd)
+		if err != nil {
+			ws.WriteMessage(websocket.TextMessage, []byte("\r\nGagal memulai sesi PTY: "+err.Error()+"\r\n"))
+			return
+		}
+		defer ptmx.Close()
+
+		// Channel untuk sinkronisasi penutupan proses terminal
+		done := make(chan struct{})
+
+		// Goroutine 1: Membaca output (stdout/stderr) -> Kirim ke UI Vue Xterm
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				n, err := ptmx.Read(buf)
+				if n > 0 {
+					_ = ws.WriteMessage(websocket.TextMessage, buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			close(done)
+		}()
+
+		// Goroutine 2: Membaca kiriman input teks ketikan dari UI Vue -> Masukkan ke stdin
+		go func() {
+			for {
+				_, message, err := ws.ReadMessage()
+				if err != nil {
+					break
+				}
+				_, _ = ptmx.Write(message)
+			}
+		}()
+
+		// Tunggu hingga proses shell selesai atau koneksi terputus
+		<-done
+		_ = cmd.Wait()
 	})
 
 	port := os.Getenv("PORT")
