@@ -56,7 +56,7 @@ onMounted(() => {
         BACK
       </button>
       <button @click="fetchTunnelRoutes" :disabled="loading" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 font-mono text-xs px-5 py-2 rounded-lg transition">
-        {{ loading ? 'ROUTE_SYNCING...' : '⚡ REFRESH ROUTES' }}
+        {{ loading ? 'ROUTES SYNCING...' : '⚡ REFRESH ROUTES' }}
       </button>
     </div>
   </header>

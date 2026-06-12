@@ -51,7 +51,7 @@ onMounted(() => {
     
     <div class="w-full sm:w-auto">
       <button @click="fetchTunnels" :disabled="loading" class="w-full sm:w-auto bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 hover:border-slate-700 font-mono text-xs px-5 py-2 rounded-lg transition duration-300">
-        {{ loading ? 'TUNNEL_SYNCING...' : '⚡ REFRESH TUNNELS' }}
+        {{ loading ? 'TUNNELS SYNCING...' : '⚡ REFRESH TUNNELS' }}
       </button>
     </div>
   </header>
